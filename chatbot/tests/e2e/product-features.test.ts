@@ -55,4 +55,30 @@ test.describe("Product features chrome", () => {
 
     expect(historyDeletes).toEqual([]);
   });
+
+  test("local mode chat POST skips Neon persist", async ({ page }) => {
+    const persistFlags: Array<boolean | undefined> = [];
+
+    await page.route("**/api/chat", async (route) => {
+      if (route.request().method() === "POST") {
+        const body = route.request().postDataJSON() as {
+          persist?: boolean;
+        };
+        persistFlags.push(body.persist);
+      }
+
+      await route.fulfill({
+        body: "data: [DONE]\n\n",
+        contentType: "text/event-stream",
+        status: 200,
+      });
+    });
+
+    await page.getByTestId("sync-mode-local").click();
+    await page.getByRole("button", { name: "留在原处" }).click();
+    await page.getByTestId("multimodal-input").fill("Local persist check");
+    await page.getByTestId("send-button").click();
+
+    await expect.poll(() => persistFlags.at(-1)).toBe(false);
+  });
 });
