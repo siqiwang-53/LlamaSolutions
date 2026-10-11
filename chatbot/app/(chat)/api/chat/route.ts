@@ -12,6 +12,7 @@ import { checkBotId } from "botid/server";
 import { after } from "next/server";
 import { createResumableStreamContext } from "resumable-stream";
 import { auth, type UserType } from "@/app/(auth)/auth";
+import { buildActiveToolNames } from "@/lib/ai/active-tools";
 import { entitlementsByUserType } from "@/lib/ai/entitlements";
 import {
   getActiveModels,
@@ -27,6 +28,8 @@ import { getWeather } from "@/lib/ai/tools/get-weather";
 import { requestSuggestions } from "@/lib/ai/tools/request-suggestions";
 import { updateDocument } from "@/lib/ai/tools/update-document";
 import { searchNews, webSearch } from "@/lib/ai/tools/web-search";
+import { AttachmentError, modelHasVision } from "@/lib/attachments";
+import { prepareMessagesForModel } from "@/lib/attachments/prepare-model-messages";
 import { isProductionEnvironment } from "@/lib/constants";
 import {
   createStreamId,
@@ -45,7 +48,11 @@ import { checkIpRateLimit } from "@/lib/ratelimit";
 import type { ChatMessage, WaitingStatusData } from "@/lib/types";
 import { convertToUIMessages, generateUUID } from "@/lib/utils";
 import { generateTitleFromUserMessage } from "../../actions";
-import { type PostRequestBody, postRequestBodySchema } from "./schema";
+import {
+  getFriendlyBodyError,
+  type PostRequestBody,
+  postRequestBodySchema,
+} from "./schema";
 
 export const maxDuration = 60;
 
@@ -73,7 +80,11 @@ export async function POST(request: Request) {
   try {
     const json = await request.json();
     requestBody = postRequestBodySchema.parse(json);
-  } catch {
+  } catch (error) {
+    const friendly = getFriendlyBodyError(error);
+    if (friendly) {
+      return new ChatbotError("bad_request:api", friendly).toResponse();
+    }
     return new ChatbotError("bad_request:api").toResponse();
   }
 
@@ -85,6 +96,7 @@ export async function POST(request: Request) {
       persist = true,
       selectedChatModel,
       selectedVisibilityType,
+      webSearchEnabled,
     } = requestBody;
 
     const [botIdResult, session] = await Promise.all([
@@ -206,6 +218,26 @@ export async function POST(request: Request) {
       longitude,
     };
 
+    const modelConfig = getActiveModels().find((m) => m.id === chatModel);
+    const modelCapabilities = await getCapabilities();
+    const capabilities = modelCapabilities[chatModel];
+    const isReasoningModel = capabilities?.reasoning === true;
+    const supportsTools = capabilities?.tools === true;
+    const supportsVision = modelHasVision(chatModel, modelCapabilities);
+
+    let modelUiMessages: ChatMessage[];
+    try {
+      modelUiMessages = await prepareMessagesForModel(uiMessages, {
+        latestUserMessageId: message?.role === "user" ? message.id : undefined,
+        supportsVision,
+      });
+    } catch (error) {
+      if (error instanceof AttachmentError) {
+        return new ChatbotError("bad_request:api", error.message).toResponse();
+      }
+      throw error;
+    }
+
     if (persist && message?.role === "user") {
       await saveMessages({
         messages: [
@@ -221,13 +253,7 @@ export async function POST(request: Request) {
       });
     }
 
-    const modelConfig = getActiveModels().find((m) => m.id === chatModel);
-    const modelCapabilities = await getCapabilities();
-    const capabilities = modelCapabilities[chatModel];
-    const isReasoningModel = capabilities?.reasoning === true;
-    const supportsTools = capabilities?.tools === true;
-
-    const modelMessages = await convertToModelMessages(uiMessages);
+    const modelMessages = await convertToModelMessages(modelUiMessages);
 
     const stream = createUIMessageStream({
       execute: async ({ writer: dataStream }) => {
@@ -293,20 +319,41 @@ export async function POST(request: Request) {
           clearHealthCheckTimer();
         };
 
+        const activeTools = buildActiveToolNames({
+          isReasoningModel,
+          supportsTools,
+          webSearchEnabled,
+        });
+        const tools = {
+          createDocument: createDocument({
+            dataStream,
+            modelId: chatModel,
+            session,
+          }),
+          editDocument: editDocument({ dataStream, session }),
+          getWeather,
+          requestSuggestions: requestSuggestions({
+            dataStream,
+            modelId: chatModel,
+            session,
+          }),
+          updateDocument: updateDocument({
+            dataStream,
+            modelId: chatModel,
+            session,
+          }),
+          ...(webSearchEnabled ? { searchNews, webSearch } : {}),
+        };
+
         const result = streamText({
-          activeTools:
-            isReasoningModel && !supportsTools
-              ? []
-              : [
-                  "getWeather",
-                  "webSearch",
-                  "searchNews",
-                  "createDocument",
-                  "editDocument",
-                  "updateDocument",
-                  "requestSuggestions",
-                ],
-          instructions: systemPrompt({ requestHints, supportsTools }),
+          activeTools: activeTools.filter((name) =>
+            Object.hasOwn(tools, name)
+          ) as Array<keyof typeof tools & string>,
+          instructions: systemPrompt({
+            requestHints,
+            supportsTools,
+            webSearchEnabled,
+          }),
           messages: modelMessages,
           model: getLanguageModel(chatModel),
           onAbort() {
@@ -336,27 +383,7 @@ export async function POST(request: Request) {
             functionId: "stream-text",
             isEnabled: isProductionEnvironment,
           },
-          tools: {
-            createDocument: createDocument({
-              dataStream,
-              modelId: chatModel,
-              session,
-            }),
-            editDocument: editDocument({ dataStream, session }),
-            getWeather,
-            requestSuggestions: requestSuggestions({
-              dataStream,
-              modelId: chatModel,
-              session,
-            }),
-            searchNews,
-            updateDocument: updateDocument({
-              dataStream,
-              modelId: chatModel,
-              session,
-            }),
-            webSearch,
-          },
+          tools,
         });
 
         dataStream.merge(

@@ -17,6 +17,7 @@ import {
 } from "react";
 import useSWR, { useSWRConfig } from "swr";
 import { unstable_serialize } from "swr/infinite";
+import { useLocalStorage } from "usehooks-ts";
 import { useDataStream } from "@/components/chat/data-stream-provider";
 import { toast } from "@/components/chat/toast";
 import type { VisibilityType } from "@/components/chat/visibility-selector";
@@ -33,6 +34,10 @@ import {
 } from "@/lib/local-chats";
 import type { ChatMessage } from "@/lib/types";
 import { fetcher, fetchWithErrorHandlers, generateUUID } from "@/lib/utils";
+import {
+  readWebSearchEnabled,
+  WEB_SEARCH_STORAGE_KEY,
+} from "@/lib/web-search-preference";
 
 type ActiveChatContextValue = {
   chatId: string;
@@ -53,6 +58,8 @@ type ActiveChatContextValue = {
   votes: Vote[] | undefined;
   currentModelId: string;
   setCurrentModelId: (id: string) => void;
+  webSearchEnabled: boolean;
+  setWebSearchEnabled: (enabled: boolean) => void;
   showCreditCardAlert: boolean;
   setShowCreditCardAlert: Dispatch<SetStateAction<boolean>>;
 };
@@ -89,6 +96,11 @@ export function ActiveChatProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     currentModelIdRef.current = currentModelId;
   }, [currentModelId]);
+  const [webSearchEnabled, setWebSearchEnabled] = useLocalStorage(
+    WEB_SEARCH_STORAGE_KEY,
+    true,
+    { initializeWithValue: false }
+  );
 
   const [input, setInput] = useState("");
   const [showCreditCardAlert, setShowCreditCardAlert] = useState(false);
@@ -147,13 +159,19 @@ export function ActiveChatProvider({ children }: { children: ReactNode }) {
       setDataStream((ds) => (ds ? [...ds, dataPart] : []));
     },
     onError: (error) => {
+      const description =
+        error instanceof ChatbotError &&
+        typeof error.cause === "string" &&
+        error.cause.trim()
+          ? error.cause
+          : error.message || "Oops, an error occurred!";
       if (error.message?.includes("AI Gateway requires a valid credit card")) {
         setShowCreditCardAlert(true);
       } else if (error instanceof ChatbotError) {
-        toast({ description: error.message, type: "error" });
+        toast({ description, type: "error" });
       } else {
         toast({
-          description: error.message || "Oops, an error occurred!",
+          description,
           type: "error",
         });
       }
@@ -202,6 +220,7 @@ export function ActiveChatProvider({ children }: { children: ReactNode }) {
               : { message: lastMessage }),
             selectedChatModel: currentModelIdRef.current,
             selectedVisibilityType: visibility,
+            webSearchEnabled: readWebSearchEnabled(),
             ...request.body,
           },
         };
@@ -367,11 +386,13 @@ export function ActiveChatProvider({ children }: { children: ReactNode }) {
       setInput,
       setMessages,
       setShowCreditCardAlert,
+      setWebSearchEnabled,
       showCreditCardAlert,
       status,
       stop,
       visibilityType: visibility,
       votes,
+      webSearchEnabled,
     }),
     [
       chatId,
@@ -390,7 +411,9 @@ export function ActiveChatProvider({ children }: { children: ReactNode }) {
       isLoading,
       votes,
       currentModelId,
+      setWebSearchEnabled,
       showCreditCardAlert,
+      webSearchEnabled,
     ]
   );
 

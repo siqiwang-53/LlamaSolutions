@@ -44,6 +44,8 @@ export function ChatShell() {
     votes,
     currentModelId,
     setCurrentModelId,
+    webSearchEnabled,
+    setWebSearchEnabled,
     showCreditCardAlert,
     setShowCreditCardAlert,
   } = useActiveChat();
@@ -152,6 +154,7 @@ export function ChatShell() {
                   messages={messages}
                   onCancelEdit={handleCancelEdit}
                   onModelChange={setCurrentModelId}
+                  onWebSearchEnabledChange={setWebSearchEnabled}
                   selectedModelId={currentModelId}
                   selectedVisibilityType={visibilityType}
                   sendMessage={
@@ -162,6 +165,7 @@ export function ChatShell() {
                   setMessages={setMessages}
                   status={status}
                   stop={stop}
+                  webSearchEnabled={webSearchEnabled}
                 />
               )}
             </div>
