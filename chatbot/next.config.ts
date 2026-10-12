@@ -49,6 +49,7 @@ const nextConfig: NextConfig = {
   },
   poweredByHeader: false,
   reactCompiler: true,
+  serverExternalPackages: ["mammoth", "unpdf"],
 };
 
 export default withBotId(nextConfig);

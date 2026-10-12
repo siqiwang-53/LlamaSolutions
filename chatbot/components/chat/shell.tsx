@@ -22,6 +22,7 @@ import { cn } from "@/lib/utils";
 import { Artifact } from "./artifact";
 import { ChatHeader } from "./chat-header";
 import { DataStreamHandler } from "./data-stream-handler";
+import { LoadedDocumentsNotice } from "./loaded-documents";
 import { submitEditedMessage } from "./message-editor";
 import { Messages } from "./messages";
 import { MultimodalInput } from "./multimodal-input";
@@ -44,6 +45,8 @@ export function ChatShell() {
     votes,
     currentModelId,
     setCurrentModelId,
+    webSearchEnabled,
+    setWebSearchEnabled,
     showCreditCardAlert,
     setShowCreditCardAlert,
   } = useActiveChat();
@@ -141,7 +144,8 @@ export function ChatShell() {
               votes={votes}
             />
 
-            <div className="sticky bottom-0 z-1 mx-auto flex w-full max-w-4xl gap-2 border-t-0 bg-background px-2 pb-3 md:px-4 md:pb-4">
+            <div className="sticky bottom-0 z-1 mx-auto flex w-full max-w-4xl flex-col gap-2 border-t-0 bg-background px-2 pb-3 md:px-4 md:pb-4">
+              {!isReadonly && <LoadedDocumentsNotice messages={messages} />}
               {!isReadonly && (
                 <MultimodalInput
                   attachments={attachments}
@@ -152,6 +156,7 @@ export function ChatShell() {
                   messages={messages}
                   onCancelEdit={handleCancelEdit}
                   onModelChange={setCurrentModelId}
+                  onWebSearchEnabledChange={setWebSearchEnabled}
                   selectedModelId={currentModelId}
                   selectedVisibilityType={visibilityType}
                   sendMessage={
@@ -162,6 +167,7 @@ export function ChatShell() {
                   setMessages={setMessages}
                   status={status}
                   stop={stop}
+                  webSearchEnabled={webSearchEnabled}
                 />
               )}
             </div>

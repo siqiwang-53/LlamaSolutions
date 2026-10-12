@@ -7,6 +7,7 @@ import {
   ArrowUpIcon,
   BrainIcon,
   EyeIcon,
+  GlobeIcon,
   LockIcon,
   WrenchIcon,
 } from "lucide-react";
@@ -51,6 +52,15 @@ import {
   lmStudioChatModels,
   type ModelCapabilities,
 } from "@/lib/ai/models";
+import {
+  FILE_INPUT_ACCEPT,
+  FILE_PICKER_HINT,
+  IMAGE_NEEDS_VISION_MESSAGE,
+  MAX_FILES_PER_MESSAGE,
+  modelHasVision,
+  resolveAttachment,
+  TOO_MANY_FILES_MESSAGE,
+} from "@/lib/attachments";
 import {
   deleteAllChatsByMode,
   deleteChatByMode,
@@ -101,6 +111,8 @@ function PureMultimodalInput({
   selectedVisibilityType,
   selectedModelId,
   onModelChange,
+  webSearchEnabled,
+  onWebSearchEnabledChange,
   editingMessage,
   onCancelEdit,
   isLoading,
@@ -121,6 +133,8 @@ function PureMultimodalInput({
   selectedVisibilityType: VisibilityType;
   selectedModelId: string;
   onModelChange?: (modelId: string) => void;
+  webSearchEnabled: boolean;
+  onWebSearchEnabledChange: (enabled: boolean) => void;
   editingMessage?: ChatMessage | null;
   onCancelEdit?: () => void;
   isLoading?: boolean;
@@ -161,6 +175,17 @@ function PureMultimodalInput({
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [uploadQueue, setUploadQueue] = useState<string[]>([]);
+  const { data: modelsResponse } = useSWR<{
+    capabilities?: Record<string, ModelCapabilities>;
+  }>(
+    `${process.env.NEXT_PUBLIC_BASE_PATH ?? ""}/api/models`,
+    (url: string) => fetch(url).then((response) => response.json()),
+    { dedupingInterval: 3_600_000, revalidateOnFocus: false }
+  );
+  const capabilities = modelsResponse?.capabilities;
+  const blockImages = capabilities
+    ? !modelHasVision(selectedModelId, capabilities)
+    : false;
   const [slashOpen, setSlashOpen] = useState(false);
   const [slashQuery, setSlashQuery] = useState("");
   const [slashIndex, setSlashIndex] = useState(0);
@@ -261,6 +286,7 @@ function PureMultimodalInput({
     sendMessage({
       parts: [
         ...attachments.map((attachment) => ({
+          filename: attachment.name,
           mediaType: attachment.contentType,
           name: attachment.name,
           type: "file" as const,
@@ -294,12 +320,26 @@ function PureMultimodalInput({
 
   const uploadFile = useCallback(
     async (file: File) => {
+      const resolved = resolveAttachment({
+        name: file.name,
+        size: file.size,
+        type: file.type,
+      });
+      if ("error" in resolved) {
+        toast.error(resolved.error);
+        return;
+      }
+      if (resolved.attachment.kind === "image" && blockImages) {
+        toast.error(IMAGE_NEEDS_VISION_MESSAGE);
+        return;
+      }
+
       if (isLocal) {
         try {
           const url = await fileToDataUrl(file);
           return {
-            contentType: file.type,
-            name: file.name,
+            contentType: resolved.attachment.mediaType,
+            name: resolved.attachment.name,
             url,
           };
         } catch {
@@ -322,11 +362,15 @@ function PureMultimodalInput({
 
         if (response.ok) {
           const data = await response.json();
-          const { url, pathname, contentType } = data;
+          const { url } = data;
+          if (!url || typeof url !== "string") {
+            toast.error("Upload failed");
+            return;
+          }
 
           return {
-            contentType,
-            name: pathname,
+            contentType: resolved.attachment.mediaType,
+            name: resolved.attachment.name,
             url,
           };
         }
@@ -336,12 +380,18 @@ function PureMultimodalInput({
         toast.error("Failed to upload file, please try again!");
       }
     },
-    [isLocal]
+    [blockImages, isLocal]
   );
 
   const handleFileChange = useCallback(
     async (event: ChangeEvent<HTMLInputElement>) => {
       const files = Array.from(event.target.files || []);
+
+      if (attachments.length + files.length > MAX_FILES_PER_MESSAGE) {
+        toast.error(TOO_MANY_FILES_MESSAGE);
+        event.target.value = "";
+        return;
+      }
 
       setUploadQueue(files.map((file) => file.name));
 
@@ -360,9 +410,10 @@ function PureMultimodalInput({
         toast.error("Failed to upload files");
       } finally {
         setUploadQueue([]);
+        event.target.value = "";
       }
     },
-    [setAttachments, uploadFile]
+    [attachments.length, setAttachments, uploadFile]
   );
 
   const handlePaste = useCallback(
@@ -377,6 +428,18 @@ function PureMultimodalInput({
       );
 
       if (imageItems.length === 0) {
+        return;
+      }
+
+      if (blockImages) {
+        event.preventDefault();
+        toast.error(IMAGE_NEEDS_VISION_MESSAGE);
+        return;
+      }
+
+      if (attachments.length + imageItems.length > MAX_FILES_PER_MESSAGE) {
+        event.preventDefault();
+        toast.error(TOO_MANY_FILES_MESSAGE);
         return;
       }
 
@@ -408,7 +471,7 @@ function PureMultimodalInput({
         setUploadQueue([]);
       }
     },
-    [setAttachments, uploadFile]
+    [attachments.length, blockImages, setAttachments, uploadFile]
   );
 
   useEffect(() => {
@@ -524,11 +587,14 @@ function PureMultimodalInput({
         )}
 
       <input
+        accept={FILE_INPUT_ACCEPT}
+        aria-label="Upload files"
         className="pointer-events-none fixed -top-4 -left-4 size-0.5 opacity-0"
         multiple
         onChange={handleFileChange}
         ref={fileInputRef}
         tabIndex={-1}
+        title={FILE_PICKER_HINT}
         type="file"
       />
 
@@ -588,8 +654,13 @@ function PureMultimodalInput({
         <PromptInputFooter className="px-3 pb-3">
           <PromptInputTools>
             <AttachmentsButton
+              blockImages={blockImages}
               fileInputRef={fileInputRef}
-              selectedModelId={selectedModelId}
+              status={status}
+            />
+            <WebSearchToggle
+              enabled={webSearchEnabled}
+              onEnabledChange={onWebSearchEnabledChange}
               status={status}
             />
             <VoiceInputButton
@@ -645,6 +716,9 @@ export const MultimodalInput = memo(
     if (prevProps.selectedModelId !== nextProps.selectedModelId) {
       return false;
     }
+    if (prevProps.webSearchEnabled !== nextProps.webSearchEnabled) {
+      return false;
+    }
     if (prevProps.editingMessage !== nextProps.editingMessage) {
       return false;
     }
@@ -683,23 +757,18 @@ function PureAttachmentPreviewItem({
 const AttachmentPreviewItem = memo(PureAttachmentPreviewItem);
 
 function PureAttachmentsButton({
+  blockImages,
   fileInputRef,
   status,
-  selectedModelId,
 }: {
+  blockImages: boolean;
   fileInputRef: React.MutableRefObject<HTMLInputElement | null>;
   status: UseChatHelpers<ChatMessage>["status"];
-  selectedModelId: string;
 }) {
-  const { data: modelsResponse } = useSWR(
-    `${process.env.NEXT_PUBLIC_BASE_PATH ?? ""}/api/models`,
-    (url: string) => fetch(url).then((r) => r.json()),
-    { dedupingInterval: 3_600_000, revalidateOnFocus: false }
-  );
-
-  const caps: Record<string, ModelCapabilities> | undefined =
-    modelsResponse?.capabilities ?? modelsResponse;
-  const hasVision = caps?.[selectedModelId]?.vision ?? false;
+  const canAttach = status === "ready" || status === "error";
+  const hint = blockImages
+    ? `${FILE_PICKER_HINT} This model cannot read images.`
+    : FILE_PICKER_HINT;
   const handleClick = useCallback(
     (event: React.MouseEvent<HTMLButtonElement>) => {
       event.preventDefault();
@@ -709,24 +778,85 @@ function PureAttachmentsButton({
   );
 
   return (
-    <Button
-      className={cn(
-        "h-7 w-7 rounded-lg border border-border/40 p-1 transition-colors",
-        hasVision
-          ? "text-foreground hover:border-border hover:text-foreground"
-          : "text-muted-foreground/30 cursor-not-allowed"
-      )}
-      data-testid="attachments-button"
-      disabled={status !== "ready" || !hasVision}
-      onClick={handleClick}
-      variant="ghost"
-    >
-      <PaperclipIcon size={14} style={{ height: 14, width: 14 }} />
-    </Button>
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <Button
+          aria-label="Attach files"
+          className={cn(
+            "h-7 w-7 rounded-lg border border-border/40 p-1 transition-colors",
+            canAttach
+              ? "text-foreground hover:border-border hover:text-foreground"
+              : "cursor-not-allowed text-muted-foreground/30"
+          )}
+          data-testid="attachments-button"
+          disabled={!canAttach}
+          onClick={handleClick}
+          title={hint}
+          type="button"
+          variant="ghost"
+        >
+          <PaperclipIcon size={14} style={{ height: 14, width: 14 }} />
+        </Button>
+      </TooltipTrigger>
+      <TooltipContent side="top" sideOffset={8}>
+        {hint}
+      </TooltipContent>
+    </Tooltip>
   );
 }
 
 const AttachmentsButton = memo(PureAttachmentsButton);
+
+function WebSearchToggle({
+  enabled,
+  onEnabledChange,
+  status,
+}: {
+  enabled: boolean;
+  onEnabledChange: (enabled: boolean) => void;
+  status: UseChatHelpers<ChatMessage>["status"];
+}) {
+  const canToggle = status === "ready" || status === "error";
+  const label = enabled ? "Web search: On" : "Web search: Off";
+  const hint = enabled
+    ? "Web search is on. The assistant can look up the web and news. If search is not configured, it will say so."
+    : "Web search is off. The assistant will not use web or news search.";
+  const handleClick = useCallback(() => {
+    onEnabledChange(!enabled);
+  }, [enabled, onEnabledChange]);
+
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <Button
+          aria-pressed={enabled}
+          className={cn(
+            "h-7 shrink-0 gap-1 rounded-lg border px-2 text-[12px]",
+            enabled
+              ? "border-foreground/20 bg-foreground/10 text-foreground"
+              : "border-border/40 text-muted-foreground"
+          )}
+          data-state={enabled ? "on" : "off"}
+          data-testid="web-search-toggle"
+          disabled={!canToggle}
+          onClick={handleClick}
+          title={hint}
+          type="button"
+          variant="ghost"
+        >
+          <GlobeIcon className="size-3.5" />
+          <span className="sm:hidden">
+            {enabled ? "Search on" : "Search off"}
+          </span>
+          <span className="hidden sm:inline">{label}</span>
+        </Button>
+      </TooltipTrigger>
+      <TooltipContent side="top" sideOffset={8}>
+        {hint}
+      </TooltipContent>
+    </Tooltip>
+  );
+}
 
 function ModelSelectorOption({
   capabilities,

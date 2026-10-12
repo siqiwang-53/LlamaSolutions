@@ -1,6 +1,7 @@
 "use client";
 import type { UseChatHelpers } from "@ai-sdk/react";
 import { useCallback } from "react";
+import { attachmentDisplayName } from "@/lib/attachments";
 import type { Vote } from "@/lib/db/schema";
 import type { ChatMessage } from "@/lib/types";
 import { cn, sanitizeText } from "@/lib/utils";
@@ -137,7 +138,7 @@ const PurePreviewMessage = ({
         <PreviewAttachment
           attachment={{
             contentType: attachment.mediaType,
-            name: attachment.filename ?? "file",
+            name: attachmentDisplayName(attachment),
             url: attachment.url,
           }}
           key={attachment.url}

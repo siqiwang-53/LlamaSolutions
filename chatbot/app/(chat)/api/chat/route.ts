@@ -12,6 +12,7 @@ import { checkBotId } from "botid/server";
 import { after } from "next/server";
 import { createResumableStreamContext } from "resumable-stream";
 import { auth, type UserType } from "@/app/(auth)/auth";
+import { buildActiveToolNames } from "@/lib/ai/active-tools";
 import { entitlementsByUserType } from "@/lib/ai/entitlements";
 import {
   getActiveModels,
@@ -27,6 +28,8 @@ import { getWeather } from "@/lib/ai/tools/get-weather";
 import { requestSuggestions } from "@/lib/ai/tools/request-suggestions";
 import { updateDocument } from "@/lib/ai/tools/update-document";
 import { searchNews, webSearch } from "@/lib/ai/tools/web-search";
+import { AttachmentError, modelHasVision } from "@/lib/attachments";
+import { prepareMessagesForModel } from "@/lib/attachments/prepare-model-messages";
 import { isProductionEnvironment } from "@/lib/constants";
 import {
   createStreamId,
@@ -41,11 +44,17 @@ import {
 } from "@/lib/db/queries";
 import type { DBMessage } from "@/lib/db/schema";
 import { ChatbotError } from "@/lib/errors";
+import { moderateText } from "@/lib/moderation/moderate";
+import { refusalFor } from "@/lib/moderation/refusal";
 import { checkIpRateLimit } from "@/lib/ratelimit";
 import type { ChatMessage, WaitingStatusData } from "@/lib/types";
 import { convertToUIMessages, generateUUID } from "@/lib/utils";
 import { generateTitleFromUserMessage } from "../../actions";
-import { type PostRequestBody, postRequestBodySchema } from "./schema";
+import {
+  getFriendlyBodyError,
+  type PostRequestBody,
+  postRequestBodySchema,
+} from "./schema";
 
 export const maxDuration = 60;
 
@@ -73,7 +82,11 @@ export async function POST(request: Request) {
   try {
     const json = await request.json();
     requestBody = postRequestBodySchema.parse(json);
-  } catch {
+  } catch (error) {
+    const friendly = getFriendlyBodyError(error);
+    if (friendly) {
+      return new ChatbotError("bad_request:api", friendly).toResponse();
+    }
     return new ChatbotError("bad_request:api").toResponse();
   }
 
@@ -85,6 +98,7 @@ export async function POST(request: Request) {
       persist = true,
       selectedChatModel,
       selectedVisibilityType,
+      webSearchEnabled,
     } = requestBody;
 
     const [botIdResult, session] = await Promise.all([
@@ -114,6 +128,28 @@ export async function POST(request: Request) {
 
       if (messageCount > entitlementsByUserType[userType].maxMessagesPerHour) {
         return new ChatbotError("rate_limit:chat").toResponse();
+      }
+    }
+
+    let blockedReply: string | null = null;
+    if (message?.role === "user") {
+      const latestUserText = message.parts
+        .filter((part) => part.type === "text")
+        .map((part) => part.text)
+        .join("\n")
+        .trim();
+      if (latestUserText) {
+        try {
+          const moderation = await moderateText(latestUserText, {
+            modelMode: "auto",
+            modelTimeoutMs: 4000,
+          });
+          if (moderation.decision === "block") {
+            blockedReply = refusalFor(moderation.categories);
+          }
+        } catch (error) {
+          console.error("Moderation failed open:", error);
+        }
       }
     }
 
@@ -147,9 +183,11 @@ export async function POST(request: Request) {
           userId: session.user.id,
           visibility: selectedVisibilityType,
         });
-        titlePromise = generateTitleFromUserMessage({ message });
+        if (!blockedReply) {
+          titlePromise = generateTitleFromUserMessage({ message });
+        }
       }
-    } else if (message?.role === "user") {
+    } else if (message?.role === "user" && !blockedReply) {
       const userMessageCount =
         messages?.filter((item) => item.role === "user").length ?? 1;
       if (userMessageCount <= 1) {
@@ -206,6 +244,77 @@ export async function POST(request: Request) {
       longitude,
     };
 
+    if (blockedReply) {
+      const reply = blockedReply;
+      if (persist && message?.role === "user") {
+        await saveMessages({
+          messages: [
+            {
+              attachments: [],
+              chatId: id,
+              createdAt: new Date(),
+              id: message.id,
+              parts: message.parts,
+              role: "user",
+            },
+          ],
+        });
+      }
+
+      const stream = createUIMessageStream({
+        execute: ({ writer: dataStream }) => {
+          const textId = generateId();
+          dataStream.write({ type: "start" });
+          dataStream.write({ id: textId, type: "text-start" });
+          dataStream.write({
+            delta: reply,
+            id: textId,
+            type: "text-delta",
+          });
+          dataStream.write({ id: textId, type: "text-end" });
+          dataStream.write({ finishReason: "stop", type: "finish" });
+        },
+        generateId: generateUUID,
+        onEnd: async ({ messages: finishedMessages }) => {
+          if (!persist || finishedMessages.length === 0) {
+            return;
+          }
+          await saveMessages({
+            messages: finishedMessages.map((currentMessage) => ({
+              attachments: [],
+              chatId: id,
+              createdAt: new Date(),
+              id: currentMessage.id,
+              parts: currentMessage.parts,
+              role: currentMessage.role,
+            })),
+          });
+        },
+      });
+
+      return createUIMessageStreamResponse({ stream });
+    }
+
+    const modelConfig = getActiveModels().find((m) => m.id === chatModel);
+    const modelCapabilities = await getCapabilities();
+    const capabilities = modelCapabilities[chatModel];
+    const isReasoningModel = capabilities?.reasoning === true;
+    const supportsTools = capabilities?.tools === true;
+    const supportsVision = modelHasVision(chatModel, modelCapabilities);
+
+    let modelUiMessages: ChatMessage[];
+    try {
+      modelUiMessages = await prepareMessagesForModel(uiMessages, {
+        latestUserMessageId: message?.role === "user" ? message.id : undefined,
+        supportsVision,
+      });
+    } catch (error) {
+      if (error instanceof AttachmentError) {
+        return new ChatbotError("bad_request:api", error.message).toResponse();
+      }
+      throw error;
+    }
+
     if (persist && message?.role === "user") {
       await saveMessages({
         messages: [
@@ -221,13 +330,7 @@ export async function POST(request: Request) {
       });
     }
 
-    const modelConfig = getActiveModels().find((m) => m.id === chatModel);
-    const modelCapabilities = await getCapabilities();
-    const capabilities = modelCapabilities[chatModel];
-    const isReasoningModel = capabilities?.reasoning === true;
-    const supportsTools = capabilities?.tools === true;
-
-    const modelMessages = await convertToModelMessages(uiMessages);
+    const modelMessages = await convertToModelMessages(modelUiMessages);
 
     const stream = createUIMessageStream({
       execute: async ({ writer: dataStream }) => {
@@ -293,20 +396,41 @@ export async function POST(request: Request) {
           clearHealthCheckTimer();
         };
 
+        const activeTools = buildActiveToolNames({
+          isReasoningModel,
+          supportsTools,
+          webSearchEnabled,
+        });
+        const tools = {
+          createDocument: createDocument({
+            dataStream,
+            modelId: chatModel,
+            session,
+          }),
+          editDocument: editDocument({ dataStream, session }),
+          getWeather,
+          requestSuggestions: requestSuggestions({
+            dataStream,
+            modelId: chatModel,
+            session,
+          }),
+          updateDocument: updateDocument({
+            dataStream,
+            modelId: chatModel,
+            session,
+          }),
+          ...(webSearchEnabled ? { searchNews, webSearch } : {}),
+        };
+
         const result = streamText({
-          activeTools:
-            isReasoningModel && !supportsTools
-              ? []
-              : [
-                  "getWeather",
-                  "webSearch",
-                  "searchNews",
-                  "createDocument",
-                  "editDocument",
-                  "updateDocument",
-                  "requestSuggestions",
-                ],
-          instructions: systemPrompt({ requestHints, supportsTools }),
+          activeTools: activeTools.filter((name) =>
+            Object.hasOwn(tools, name)
+          ) as Array<keyof typeof tools & string>,
+          instructions: systemPrompt({
+            requestHints,
+            supportsTools,
+            webSearchEnabled,
+          }),
           messages: modelMessages,
           model: getLanguageModel(chatModel),
           onAbort() {
@@ -336,27 +460,7 @@ export async function POST(request: Request) {
             functionId: "stream-text",
             isEnabled: isProductionEnvironment,
           },
-          tools: {
-            createDocument: createDocument({
-              dataStream,
-              modelId: chatModel,
-              session,
-            }),
-            editDocument: editDocument({ dataStream, session }),
-            getWeather,
-            requestSuggestions: requestSuggestions({
-              dataStream,
-              modelId: chatModel,
-              session,
-            }),
-            searchNews,
-            updateDocument: updateDocument({
-              dataStream,
-              modelId: chatModel,
-              session,
-            }),
-            webSearch,
-          },
+          tools,
         });
 
         dataStream.merge(

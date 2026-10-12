@@ -48,6 +48,17 @@ export const regularPrompt = `You are a helpful assistant. Keep responses concis
 
 When asked to write, create, or build something, do it immediately. Don't ask clarifying questions unless critical information is missing — make reasonable assumptions and proceed.`;
 
+export const attachmentPrompt = `Attached files:
+- PDF, Word, and text files are included in the user message as extracted text. A PDF has [Page N] markers. Simple tables may appear as spaced columns.
+- Those documents stay loaded for later questions in the same chat. You may only see the most relevant excerpts, not the whole file.
+- If a note says some pages were left out, say that and do not invent the missing part. Invite the user to ask about a page or topic.
+- Images are visible only when you can see them.`;
+
+export const webSearchOffPrompt = `Web search is turned off for this conversation.
+- Do not call webSearch or searchNews, and do not invent live news, prices, or website contents.
+- If the user asks for those, say that web search is off and they can turn it on with the Search button next to the message box.
+- Weather at a named city can still use getWeather.`;
+
 export const liveSearchPrompt = `Live facts (news, stock prices, websites, current events):
 - You do not know live data. Never invent news, prices, headlines, or what a website currently says.
 - Latest news / "what happened today" → call searchNews.
@@ -73,17 +84,21 @@ About the origin of user's request:
 export const systemPrompt = ({
   requestHints,
   supportsTools,
+  webSearchEnabled,
 }: {
   requestHints: RequestHints;
   supportsTools: boolean;
+  webSearchEnabled: boolean;
 }) => {
   const requestPrompt = getRequestPromptFromHints(requestHints);
 
   if (!supportsTools) {
-    return `${regularPrompt}\n\n${requestPrompt}`;
+    return `${regularPrompt}\n\n${attachmentPrompt}\n\n${requestPrompt}`;
   }
 
-  return `${regularPrompt}\n\n${liveSearchPrompt}\n\n${requestPrompt}\n\n${artifactsPrompt}`;
+  const searchPrompt = webSearchEnabled ? liveSearchPrompt : webSearchOffPrompt;
+
+  return `${regularPrompt}\n\n${attachmentPrompt}\n\n${searchPrompt}\n\n${requestPrompt}\n\n${artifactsPrompt}`;
 };
 
 export const codePrompt = `
