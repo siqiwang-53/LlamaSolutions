@@ -12,6 +12,7 @@ import {
   IMAGE_NEEDS_VISION_MESSAGE,
   isVercelBlobUrl,
   LEGACY_DOC_MESSAGE,
+  listLoadedDocuments,
   MAX_DOCUMENT_BYTES,
   MAX_IMAGE_BYTES,
   modelHasVision,
@@ -230,6 +231,80 @@ describe("prepareMessagesForModel", () => {
         return true;
       }
     );
+  });
+
+  it("keeps an earlier document available for a follow-up question", async () => {
+    const followUpId = "f47ac10b-58cc-4372-a567-0e02b2c3d480";
+    const messages = [
+      {
+        id: chatId,
+        parts: [
+          {
+            filename: "handbook.txt",
+            mediaType: "text/plain",
+            type: "file",
+            url: dataUrl("text/plain", "Library hours are 8am to 6pm."),
+          },
+          { text: "I uploaded the handbook.", type: "text" },
+        ],
+        role: "user",
+      },
+      {
+        id: "assistant-1",
+        parts: [{ text: "Thanks, I have it.", type: "text" }],
+        role: "assistant",
+      },
+      {
+        id: followUpId,
+        parts: [{ text: "What are the library hours?", type: "text" }],
+        role: "user",
+      },
+    ] as ChatMessage[];
+
+    const prepared = await prepareMessagesForModel(messages, {
+      latestUserMessageId: followUpId,
+      supportsVision: false,
+    });
+    const firstText = (prepared[0]?.parts ?? [])
+      .map((part) => ("text" in part ? part.text : ""))
+      .join("\n");
+    const followUpText = (prepared[2]?.parts ?? [])
+      .map((part) => ("text" in part ? part.text : ""))
+      .join("\n");
+
+    assert.match(firstText, /still loaded/);
+    assert.doesNotMatch(firstText, /8am to 6pm/);
+    assert.match(followUpText, /8am to 6pm/);
+    assert.match(followUpText, /What are the library hours/);
+  });
+});
+
+describe("listLoadedDocuments", () => {
+  it("lists documents already in the chat and skips images", () => {
+    const documents = listLoadedDocuments([
+      {
+        parts: [
+          {
+            filename: "handbook.pdf",
+            mediaType: "application/pdf",
+            type: "file",
+            url: "data:application/pdf;base64,abc",
+          },
+          {
+            filename: "photo.png",
+            mediaType: "image/png",
+            type: "file",
+            url: "data:image/png;base64,abc",
+          },
+        ],
+        role: "user",
+      },
+    ]);
+    assert.deepEqual(
+      documents.map((document) => document.name),
+      ["handbook.pdf"]
+    );
+    assert.equal(documents[0]?.label, "PDF");
   });
 });
 

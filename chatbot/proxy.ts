@@ -21,6 +21,23 @@ export async function proxy(request: NextRequest) {
 
   const base = process.env.NEXT_PUBLIC_BASE_PATH ?? "";
 
+  if (pathname === "/api/moderation" && !token) {
+    const authorizationHeader = request.headers.get("authorization") ?? "";
+    const hasPresentedKey =
+      authorizationHeader.toLowerCase().startsWith("bearer ") ||
+      Boolean(request.headers.get("x-moderation-key"));
+    if (!hasPresentedKey) {
+      return NextResponse.json(
+        {
+          error:
+            "Sign in, or set MODERATION_API_KEY and send Authorization: Bearer or the x-moderation-key header.",
+        },
+        { status: 401 }
+      );
+    }
+    return NextResponse.next();
+  }
+
   if (!token) {
     const redirectUrl = encodeURIComponent(new URL(request.url).pathname);
 

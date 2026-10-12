@@ -42,6 +42,11 @@ export const PreviewAttachment = ({
           <span className="line-clamp-3 break-all text-[10px] text-muted-foreground leading-tight">
             {name || "File"}
           </span>
+          {!isUploading && !onRemove ? (
+            <span className="font-medium text-[10px] text-foreground">
+              Loaded
+            </span>
+          ) : null}
         </div>
       )}
 

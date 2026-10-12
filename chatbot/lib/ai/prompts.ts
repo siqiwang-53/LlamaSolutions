@@ -49,8 +49,9 @@ export const regularPrompt = `You are a helpful assistant. Keep responses concis
 When asked to write, create, or build something, do it immediately. Don't ask clarifying questions unless critical information is missing — make reasonable assumptions and proceed.`;
 
 export const attachmentPrompt = `Attached files:
-- PDF, Word, and text files are included in the user message as extracted text. Answer from that text.
-- If the extracted text says it was cut off, tell the user. Do not invent the missing part.
+- PDF, Word, and text files are included in the user message as extracted text. A PDF has [Page N] markers. Simple tables may appear as spaced columns.
+- Those documents stay loaded for later questions in the same chat. You may only see the most relevant excerpts, not the whole file.
+- If a note says some pages were left out, say that and do not invent the missing part. Invite the user to ask about a page or topic.
 - Images are visible only when you can see them.`;
 
 export const webSearchOffPrompt = `Web search is turned off for this conversation.

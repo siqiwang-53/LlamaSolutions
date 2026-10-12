@@ -5,21 +5,27 @@ import {
   decodeDataUrl,
   EMPTY_FILE_MESSAGE,
   fileTooLargeMessage,
-  formatDocumentForModel,
   IMAGE_NEEDS_VISION_MESSAGE,
   isVercelBlobUrl,
   MAX_DOCUMENT_BYTES,
-  MAX_EXTRACTED_CHARS_TOTAL,
   MAX_FILES_PER_MESSAGE,
   MAX_IMAGE_BYTES,
   resolveMediaType,
   TOO_MANY_FILES_MESSAGE,
 } from "@/lib/attachments";
+import { buildDocumentContext } from "@/lib/attachments/document-context";
 import { extractDocumentText } from "@/lib/attachments/extract-text";
 import type { ChatMessage } from "@/lib/types";
 
 type UiPart = ChatMessage["parts"][number];
 type FilePart = Extract<UiPart, { type: "file" }> & { name?: string };
+
+type PendingDocument = {
+  fatal: boolean;
+  mediaType: DocumentMediaType;
+  name: string;
+  url: string;
+};
 
 function isFilePart(part: UiPart): part is FilePart {
   return part.type === "file";
@@ -89,138 +95,222 @@ function assertImageUrl(url: string) {
   );
 }
 
-function consumeExtractedText(text: string, budget: { remaining: number }) {
-  if (budget.remaining <= 0) {
-    return null;
-  }
-
-  if (text.length <= budget.remaining) {
-    budget.remaining -= text.length;
-    return text;
-  }
-
-  const slice = text.slice(0, budget.remaining);
-  budget.remaining = 0;
-  return `${slice}\n\n[The extracted text was cut off to fit the message limit.]`;
+function textOf(parts: UiPart[]) {
+  return parts
+    .filter((part) => part.type === "text" && "text" in part)
+    .map((part) => ("text" in part ? part.text : ""))
+    .join("\n")
+    .trim();
 }
 
-async function rewriteUserParts(
-  parts: UiPart[],
-  options: { isLatest: boolean; supportsVision: boolean },
-  budget: { remaining: number }
-) {
-  const fileCount = parts.filter(isFilePart).length;
-  if (options.isLatest && fileCount > MAX_FILES_PER_MESSAGE) {
-    throw new AttachmentError(TOO_MANY_FILES_MESSAGE);
+function stillLoadedNote(name: string) {
+  return `Document "${name}" is still loaded in this chat. Relevant excerpts are included with the latest question.`;
+}
+
+async function loadDocuments(documents: PendingDocument[]) {
+  const unique = new Map<string, PendingDocument>();
+  for (const document of documents) {
+    const existing = unique.get(document.url);
+    if (!existing) {
+      unique.set(document.url, document);
+      continue;
+    }
+    if (document.fatal) {
+      existing.fatal = true;
+    }
   }
 
-  const rewritten: UiPart[] = [];
-
-  for (const part of parts) {
-    if (!isFilePart(part)) {
-      rewritten.push(part);
-      continue;
-    }
-
-    const name = attachmentDisplayName(part);
-    const resolved = resolveMediaType(name, part.mediaType);
-    if ("error" in resolved) {
-      if (options.isLatest) {
-        throw new AttachmentError(resolved.error);
-      }
-      rewritten.push({
-        text: `An earlier attachment named "${name}" was skipped because its file type is not supported.`,
-        type: "text",
-      });
-      continue;
-    }
-
-    if (resolved.kind === "image") {
-      if (!options.supportsVision) {
-        if (options.isLatest) {
-          throw new AttachmentError(IMAGE_NEEDS_VISION_MESSAGE);
+  return await Promise.all(
+    [...unique.values()].map(async (document) => {
+      try {
+        const bytes = await readDocumentBytes(document.url, document.name);
+        const text = await extractDocumentText({
+          bytes,
+          mediaType: document.mediaType,
+          name: document.name,
+        });
+        return { document, text };
+      } catch (error) {
+        if (document.fatal) {
+          if (error instanceof AttachmentError) {
+            throw error;
+          }
+          throw new AttachmentError(`Could not read "${document.name}".`, {
+            cause: error,
+          });
         }
-        rewritten.push({
-          text: `An earlier message included an image named "${name}". This model cannot view images.`,
-          type: "text",
-        });
-        continue;
+        return {
+          document,
+          error:
+            error instanceof AttachmentError
+              ? error.message
+              : `An earlier attachment named "${document.name}" could not be read.`,
+        };
       }
-
-      if (options.isLatest) {
-        assertImageUrl(part.url);
-      }
-
-      rewritten.push({
-        filename: name,
-        mediaType: resolved.mediaType,
-        type: "file",
-        url: part.url,
-      });
-      continue;
-    }
-
-    try {
-      // Later files in the same message share one text budget, so they are read in order.
-      // biome-ignore lint/performance/noAwaitInLoops: shared extraction budget
-      const bytes = await readDocumentBytes(part.url, name);
-      const extracted = await extractDocumentText({
-        bytes,
-        mediaType: resolved.mediaType as DocumentMediaType,
-        name,
-      });
-      const fitted = consumeExtractedText(extracted, budget);
-      rewritten.push({
-        text: fitted
-          ? formatDocumentForModel(name, resolved.mediaType, fitted)
-          : `Attached file "${name}" was not included because the message is already long.`,
-        type: "text",
-      });
-    } catch (error) {
-      if (!options.isLatest) {
-        rewritten.push({
-          text: `An earlier attachment named "${name}" could not be read.`,
-          type: "text",
-        });
-        continue;
-      }
-      if (error instanceof AttachmentError) {
-        throw error;
-      }
-      throw new AttachmentError(`Could not read "${name}".`, { cause: error });
-    }
-  }
-
-  return rewritten;
+    })
+  );
 }
 
 export async function prepareMessagesForModel(
   messages: ChatMessage[],
   options: { latestUserMessageId?: string; supportsVision: boolean }
 ) {
-  const budget = { remaining: MAX_EXTRACTED_CHARS_TOTAL };
-  const next: ChatMessage[] = [];
+  const lastUserId = [...messages]
+    .reverse()
+    .find((message) => message.role === "user")?.id;
+  const anchorId = options.latestUserMessageId ?? lastUserId;
+  const strict = Boolean(options.latestUserMessageId);
+  const pending: PendingDocument[] = [];
+  const seenUrls = new Set<string>();
 
   for (const message of messages) {
     if (message.role !== "user") {
-      next.push(message);
       continue;
     }
+    const isStrictLatest = strict && message.id === options.latestUserMessageId;
+    const fileCount = message.parts.filter(isFilePart).length;
+    if (isStrictLatest && fileCount > MAX_FILES_PER_MESSAGE) {
+      throw new AttachmentError(TOO_MANY_FILES_MESSAGE);
+    }
 
-    next.push({
-      ...message,
-      // Each message draws from the same extraction budget as the ones before it.
-      // biome-ignore lint/performance/noAwaitInLoops: shared extraction budget
-      parts: await rewriteUserParts(
-        message.parts,
-        {
-          isLatest: message.id === options.latestUserMessageId,
-          supportsVision: options.supportsVision,
-        },
-        budget
-      ),
-    });
+    for (const part of message.parts) {
+      if (!isFilePart(part)) {
+        continue;
+      }
+      const name = attachmentDisplayName(part);
+      const resolved = resolveMediaType(name, part.mediaType);
+      if ("error" in resolved || resolved.kind !== "document") {
+        continue;
+      }
+      if (seenUrls.has(part.url)) {
+        continue;
+      }
+      seenUrls.add(part.url);
+      pending.push({
+        fatal: isStrictLatest,
+        mediaType: resolved.mediaType as DocumentMediaType,
+        name,
+        url: part.url,
+      });
+    }
   }
 
-  return next;
+  const loaded = await loadDocuments(pending);
+  const readable = loaded.flatMap((item) => {
+    if (!("text" in item) || typeof item.text !== "string") {
+      return [];
+    }
+    return [
+      {
+        mediaType: item.document.mediaType,
+        name: item.document.name,
+        text: item.text,
+        url: item.document.url,
+      },
+    ];
+  });
+  const failures = new Map(
+    loaded.flatMap((item) =>
+      "error" in item ? [[item.document.url, item.error] as const] : []
+    )
+  );
+
+  const query = messages
+    .filter((message) => message.role === "user")
+    .slice(-2)
+    .map((message) => textOf(message.parts))
+    .filter((text) => text.length > 0)
+    .join("\n")
+    .slice(-1500);
+
+  const context =
+    readable.length > 0 ? buildDocumentContext(readable, query) : null;
+  const readableUrls = new Set(readable.map((item) => item.url));
+
+  return messages.map((message) => {
+    if (message.role !== "user") {
+      return message;
+    }
+
+    const isAnchor = message.id === anchorId;
+    const isStrictLatest = strict && message.id === options.latestUserMessageId;
+    const noted = new Set<string>();
+    const rewritten: UiPart[] = [];
+
+    for (const part of message.parts) {
+      if (!isFilePart(part)) {
+        rewritten.push(part);
+        continue;
+      }
+
+      const name = attachmentDisplayName(part);
+      const resolved = resolveMediaType(name, part.mediaType);
+      if ("error" in resolved) {
+        if (isStrictLatest) {
+          throw new AttachmentError(resolved.error);
+        }
+        rewritten.push({
+          text: `An earlier attachment named "${name}" was skipped because its file type is not supported.`,
+          type: "text",
+        });
+        continue;
+      }
+
+      if (resolved.kind === "image") {
+        if (!options.supportsVision) {
+          if (isStrictLatest) {
+            throw new AttachmentError(IMAGE_NEEDS_VISION_MESSAGE);
+          }
+          rewritten.push({
+            text: `An earlier message included an image named "${name}". This model cannot view images.`,
+            type: "text",
+          });
+          continue;
+        }
+
+        if (isStrictLatest) {
+          assertImageUrl(part.url);
+        }
+
+        rewritten.push({
+          filename: name,
+          mediaType: resolved.mediaType,
+          type: "file",
+          url: part.url,
+        });
+        continue;
+      }
+
+      if (failures.has(part.url)) {
+        rewritten.push({
+          text:
+            failures.get(part.url) ??
+            `An earlier attachment named "${name}" could not be read.`,
+          type: "text",
+        });
+        continue;
+      }
+
+      if (!readableUrls.has(part.url)) {
+        continue;
+      }
+
+      if (!isAnchor && !noted.has(part.url)) {
+        noted.add(part.url);
+        rewritten.push({
+          text: stillLoadedNote(name),
+          type: "text",
+        });
+      }
+    }
+
+    if (isAnchor && context) {
+      rewritten.unshift({ text: context, type: "text" });
+    }
+
+    return {
+      ...message,
+      parts: rewritten,
+    };
+  });
 }

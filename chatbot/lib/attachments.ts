@@ -1,8 +1,10 @@
 export const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
 export const MAX_DOCUMENT_BYTES = 10 * 1024 * 1024;
 export const MAX_FILES_PER_MESSAGE = 5;
-export const MAX_EXTRACTED_CHARS = 24_000;
-export const MAX_EXTRACTED_CHARS_TOTAL = 48_000;
+/** Safety cap while indexing a file. The model only sees a smaller excerpt. */
+export const MAX_INDEXED_CHARS = 400_000;
+/** Characters of document text placed in one model request. */
+export const DOCUMENT_CONTEXT_CHAR_BUDGET = 12_000;
 export const MAX_FILE_URL_LENGTH = 14_500_000;
 
 export const IMAGE_MEDIA_TYPES = [
@@ -49,7 +51,7 @@ export const FILE_TOO_LARGE_TO_SEND = "This file is too large to send.";
 export const FILE_NAME_REQUIRED = "Choose a file that has a name.";
 
 export const FILE_PICKER_HINT =
-  "Attach PNG, JPEG, GIF, WebP, PDF, Word (.docx), TXT, Markdown, CSV, or JSON. Up to 5 files. Images up to 5 MB. Documents up to 10 MB.";
+  "Attach PNG, JPEG, GIF, WebP, PDF, Word (.docx), TXT, Markdown, CSV, or JSON. Up to 5 files. Images up to 5 MB. Documents up to 10 MB. PDFs and documents stay loaded in this chat for follow-up questions.";
 
 export const FILE_INPUT_ACCEPT = [
   ".png",
@@ -336,11 +338,60 @@ export function limitExtractedText(name: string, text: string) {
     );
   }
 
-  if (normalized.length <= MAX_EXTRACTED_CHARS) {
+  if (normalized.length <= MAX_INDEXED_CHARS) {
     return normalized;
   }
 
-  return `${normalized.slice(0, MAX_EXTRACTED_CHARS)}\n\n[The extracted text was cut off after ${MAX_EXTRACTED_CHARS} characters.]`;
+  return `${normalized.slice(0, MAX_INDEXED_CHARS)}\n\n[Indexing stopped after ${MAX_INDEXED_CHARS} characters. Later text was not loaded. Ask about a specific section if you need it.]`;
+}
+
+export type LoadedDocument = {
+  label: string;
+  name: string;
+  url: string;
+};
+
+export function listLoadedDocuments(
+  messages: Array<{
+    parts: Array<{
+      filename?: string;
+      mediaType?: string;
+      name?: string;
+      type: string;
+      url?: string;
+    }>;
+    role: string;
+  }>
+) {
+  const seen = new Set<string>();
+  const documents: LoadedDocument[] = [];
+
+  for (const message of messages) {
+    if (message.role !== "user") {
+      continue;
+    }
+    for (const part of message.parts) {
+      if (part.type !== "file" || !part.url) {
+        continue;
+      }
+      const name = attachmentDisplayName(part);
+      const resolved = resolveMediaType(name, part.mediaType ?? "");
+      if ("error" in resolved || resolved.kind !== "document") {
+        continue;
+      }
+      if (seen.has(part.url)) {
+        continue;
+      }
+      seen.add(part.url);
+      documents.push({
+        label: fileKindLabel(resolved.mediaType, name),
+        name,
+        url: part.url,
+      });
+    }
+  }
+
+  return documents;
 }
 
 export function formatDocumentForModel(

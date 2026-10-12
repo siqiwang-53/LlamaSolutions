@@ -44,6 +44,8 @@ import {
 } from "@/lib/db/queries";
 import type { DBMessage } from "@/lib/db/schema";
 import { ChatbotError } from "@/lib/errors";
+import { moderateText } from "@/lib/moderation/moderate";
+import { refusalFor } from "@/lib/moderation/refusal";
 import { checkIpRateLimit } from "@/lib/ratelimit";
 import type { ChatMessage, WaitingStatusData } from "@/lib/types";
 import { convertToUIMessages, generateUUID } from "@/lib/utils";
@@ -129,6 +131,28 @@ export async function POST(request: Request) {
       }
     }
 
+    let blockedReply: string | null = null;
+    if (message?.role === "user") {
+      const latestUserText = message.parts
+        .filter((part) => part.type === "text")
+        .map((part) => part.text)
+        .join("\n")
+        .trim();
+      if (latestUserText) {
+        try {
+          const moderation = await moderateText(latestUserText, {
+            modelMode: "auto",
+            modelTimeoutMs: 4000,
+          });
+          if (moderation.decision === "block") {
+            blockedReply = refusalFor(moderation.categories);
+          }
+        } catch (error) {
+          console.error("Moderation failed open:", error);
+        }
+      }
+    }
+
     const isToolApprovalFlow = persist
       ? Boolean(messages)
       : Boolean(
@@ -159,9 +183,11 @@ export async function POST(request: Request) {
           userId: session.user.id,
           visibility: selectedVisibilityType,
         });
-        titlePromise = generateTitleFromUserMessage({ message });
+        if (!blockedReply) {
+          titlePromise = generateTitleFromUserMessage({ message });
+        }
       }
-    } else if (message?.role === "user") {
+    } else if (message?.role === "user" && !blockedReply) {
       const userMessageCount =
         messages?.filter((item) => item.role === "user").length ?? 1;
       if (userMessageCount <= 1) {
@@ -217,6 +243,57 @@ export async function POST(request: Request) {
       latitude,
       longitude,
     };
+
+    if (blockedReply) {
+      const reply = blockedReply;
+      if (persist && message?.role === "user") {
+        await saveMessages({
+          messages: [
+            {
+              attachments: [],
+              chatId: id,
+              createdAt: new Date(),
+              id: message.id,
+              parts: message.parts,
+              role: "user",
+            },
+          ],
+        });
+      }
+
+      const stream = createUIMessageStream({
+        execute: ({ writer: dataStream }) => {
+          const textId = generateId();
+          dataStream.write({ type: "start" });
+          dataStream.write({ id: textId, type: "text-start" });
+          dataStream.write({
+            delta: reply,
+            id: textId,
+            type: "text-delta",
+          });
+          dataStream.write({ id: textId, type: "text-end" });
+          dataStream.write({ finishReason: "stop", type: "finish" });
+        },
+        generateId: generateUUID,
+        onEnd: async ({ messages: finishedMessages }) => {
+          if (!persist || finishedMessages.length === 0) {
+            return;
+          }
+          await saveMessages({
+            messages: finishedMessages.map((currentMessage) => ({
+              attachments: [],
+              chatId: id,
+              createdAt: new Date(),
+              id: currentMessage.id,
+              parts: currentMessage.parts,
+              role: currentMessage.role,
+            })),
+          });
+        },
+      });
+
+      return createUIMessageStreamResponse({ stream });
+    }
 
     const modelConfig = getActiveModels().find((m) => m.id === chatModel);
     const modelCapabilities = await getCapabilities();

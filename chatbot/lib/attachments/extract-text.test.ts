@@ -80,7 +80,8 @@ describe("extractDocumentText", () => {
       mediaType: "application/pdf",
       name: "hello.pdf",
     });
-    assert.equal(pdf, "Hello PDF");
+    assert.match(pdf, /\[Page 1\]/);
+    assert.match(pdf, /Hello PDF/);
 
     const docx = await extractDocumentText({
       bytes: new Uint8Array(HELLO_DOCX),
