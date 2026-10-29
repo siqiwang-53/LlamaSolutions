@@ -12,21 +12,28 @@ import { checkBotId } from "botid/server";
 import { after } from "next/server";
 import { createResumableStreamContext } from "resumable-stream";
 import { auth, type UserType } from "@/app/(auth)/auth";
+import { fetchWebSearchContext } from "@/lib/ai/duckduckgo";
+import {
+  LIVE_INFO_NOTICE,
+  needsLiveInfo,
+  webSearchOffPrompt,
+} from "@/lib/ai/live-info";
 import { entitlementsByUserType } from "@/lib/ai/entitlements";
 import {
-  getActiveModels,
+  allowedModelIds,
+  chatModels,
+  DEFAULT_CHAT_MODEL,
   getCapabilities,
   getModelAvailability,
-  resolveChatModel,
 } from "@/lib/ai/models";
 import { type RequestHints, systemPrompt } from "@/lib/ai/prompts";
 import { getLanguageModel } from "@/lib/ai/providers";
 import { createDocument } from "@/lib/ai/tools/create-document";
 import { editDocument } from "@/lib/ai/tools/edit-document";
 import { getWeather } from "@/lib/ai/tools/get-weather";
+import { webSearch } from "@/lib/ai/tools/web-search";
 import { requestSuggestions } from "@/lib/ai/tools/request-suggestions";
 import { updateDocument } from "@/lib/ai/tools/update-document";
-import { searchNews, webSearch } from "@/lib/ai/tools/web-search";
 import { isProductionEnvironment } from "@/lib/constants";
 import {
   createStreamId,
@@ -46,6 +53,10 @@ import type { ChatMessage, WaitingStatusData } from "@/lib/types";
 import { convertToUIMessages, generateUUID } from "@/lib/utils";
 import { generateTitleFromUserMessage } from "../../actions";
 import { type PostRequestBody, postRequestBodySchema } from "./schema";
+
+import { appendFile } from "node:fs/promises";
+import { isFlagged } from "@/lib/moderation";
+
 
 export const maxDuration = 60;
 
@@ -82,9 +93,9 @@ export async function POST(request: Request) {
       id,
       message,
       messages,
-      persist = true,
       selectedChatModel,
       selectedVisibilityType,
+      webSearch: webSearchEnabled,
     } = requestBody;
 
     const [botIdResult, session] = await Promise.all([
@@ -100,68 +111,54 @@ export async function POST(request: Request) {
       return new ChatbotError("unauthorized:chat").toResponse();
     }
 
-    const chatModel = resolveChatModel(selectedChatModel);
+    const chatModel = allowedModelIds.has(selectedChatModel)
+      ? selectedChatModel
+      : DEFAULT_CHAT_MODEL;
 
     await checkIpRateLimit(ipAddress(request));
 
     const userType: UserType = session.user.type;
 
-    if (persist) {
-      const messageCount = await getMessageCountByUserId({
-        differenceInHours: 1,
-        id: session.user.id,
-      });
+    const messageCount = await getMessageCountByUserId({
+      differenceInHours: 1,
+      id: session.user.id,
+    });
 
-      if (messageCount > entitlementsByUserType[userType].maxMessagesPerHour) {
-        return new ChatbotError("rate_limit:chat").toResponse();
+    if (messageCount > entitlementsByUserType[userType].maxMessagesPerHour) {
+      return new ChatbotError("rate_limit:chat").toResponse();
+    }
+
+    const isToolApprovalFlow = Boolean(messages);
+    if (message?.role === "user") {
+      const text = message.parts.map((p) => (p.type === "text" ? p.text : "")).join(" ");
+
+      if (await isFlagged(text)) {
+        return new ChatbotError("forbidden:moderation").toResponse();
       }
     }
 
-    const isToolApprovalFlow = persist
-      ? Boolean(messages)
-      : Boolean(
-          messages?.some((msg) =>
-            msg.parts?.some((part) => {
-              const { state } = part as { state?: string };
-              return (
-                state === "approval-responded" || state === "output-denied"
-              );
-            })
-          )
-        );
-
-    const chat = persist ? await getChatById({ id }) : null;
+    const chat = await getChatById({ id });
     let messagesFromDb: DBMessage[] = [];
     let titlePromise: Promise<string> | null = null;
 
-    if (persist) {
-      if (chat) {
-        if (chat.userId !== session.user.id) {
-          return new ChatbotError("forbidden:chat").toResponse();
-        }
-        messagesFromDb = await getMessagesByChatId({ id });
-      } else if (message?.role === "user") {
-        await saveChat({
-          id,
-          title: "New chat",
-          userId: session.user.id,
-          visibility: selectedVisibilityType,
-        });
-        titlePromise = generateTitleFromUserMessage({ message });
+    if (chat) {
+      if (chat.userId !== session.user.id) {
+        return new ChatbotError("forbidden:chat").toResponse();
       }
+      messagesFromDb = await getMessagesByChatId({ id });
     } else if (message?.role === "user") {
-      const userMessageCount =
-        messages?.filter((item) => item.role === "user").length ?? 1;
-      if (userMessageCount <= 1) {
-        titlePromise = generateTitleFromUserMessage({ message });
-      }
+      await saveChat({
+        id,
+        title: "New chat",
+        userId: session.user.id,
+        visibility: selectedVisibilityType,
+      });
+      titlePromise = generateTitleFromUserMessage({ message });
     }
 
     let uiMessages: ChatMessage[];
 
-    if (!persist) {
-      uiMessages = (messages ?? (message ? [message] : [])) as ChatMessage[];
-    } else if (isToolApprovalFlow && messages) {
+    if (isToolApprovalFlow && messages) {
       const dbMessages = convertToUIMessages(messagesFromDb);
       const approvalStates = new Map(
         messages.flatMap(
@@ -206,7 +203,7 @@ export async function POST(request: Request) {
       longitude,
     };
 
-    if (persist && message?.role === "user") {
+    if (message?.role === "user") {
       await saveMessages({
         messages: [
           {
@@ -221,7 +218,7 @@ export async function POST(request: Request) {
       });
     }
 
-    const modelConfig = getActiveModels().find((m) => m.id === chatModel);
+    const modelConfig = chatModels.find((m) => m.id === chatModel);
     const modelCapabilities = await getCapabilities();
     const capabilities = modelCapabilities[chatModel];
     const isReasoningModel = capabilities?.reasoning === true;
@@ -229,8 +226,50 @@ export async function POST(request: Request) {
 
     const modelMessages = await convertToModelMessages(uiMessages);
 
+    const userQuery =
+      message?.role === "user"
+        ? message.parts
+            .flatMap((part) => (part.type === "text" ? [part.text] : []))
+            .join(" ")
+            .trim()
+        : "";
+
+    let webSearchContext = "";
+    if (webSearchEnabled && userQuery) {
+      const fetchedWebSearch = await fetchWebSearchContext(userQuery);
+      webSearchContext = fetchedWebSearch.context;
+    }
+
+    const refuseLiveGuess = !webSearchEnabled && needsLiveInfo(userQuery);
+
     const stream = createUIMessageStream({
       execute: async ({ writer: dataStream }) => {
+        if (refuseLiveGuess) {
+          const textId = generateId();
+          dataStream.write({ type: "start" });
+          dataStream.write({ type: "start-step" });
+          dataStream.write({ id: textId, type: "text-start" });
+          dataStream.write({
+            delta: LIVE_INFO_NOTICE,
+            id: textId,
+            type: "text-delta",
+          });
+          dataStream.write({ id: textId, type: "text-end" });
+          dataStream.write({ type: "finish-step" });
+          dataStream.write({ finishReason: "stop", type: "finish" });
+
+          if (titlePromise) {
+            try {
+              const title = await titlePromise;
+              dataStream.write({ data: title, type: "data-chat-title" });
+              updateChatTitleById({ chatId: id, title });
+            } catch {
+              /* non-fatal */
+            }
+          }
+          return;
+        }
+
         const modelName = modelConfig?.name ?? chatModel;
         let hasModelActivity = false;
         let healthCheckTimer: ReturnType<typeof setTimeout> | undefined;
@@ -295,18 +334,18 @@ export async function POST(request: Request) {
 
         const result = streamText({
           activeTools:
-            isReasoningModel && !supportsTools
+            webSearchEnabled || (isReasoningModel && !supportsTools)
               ? []
               : [
-                  "getWeather",
-                  "webSearch",
-                  "searchNews",
-                  "createDocument",
-                  "editDocument",
-                  "updateDocument",
-                  "requestSuggestions",
-                ],
-          instructions: systemPrompt({ requestHints, supportsTools }),
+                "getWeather",
+                "createDocument",
+                "editDocument",
+                "updateDocument",
+                "requestSuggestions",
+                "webSearch",
+
+              ],
+          instructions: `${systemPrompt({ requestHints, supportsTools })}${webSearchEnabled ? "" : webSearchOffPrompt}${webSearchContext}`,
           messages: modelMessages,
           model: getLanguageModel(chatModel),
           onAbort() {
@@ -349,7 +388,6 @@ export async function POST(request: Request) {
               modelId: chatModel,
               session,
             }),
-            searchNews,
             updateDocument: updateDocument({
               dataStream,
               modelId: chatModel,
@@ -370,9 +408,7 @@ export async function POST(request: Request) {
           try {
             const title = await titlePromise;
             dataStream.write({ data: title, type: "data-chat-title" });
-            if (persist) {
-              updateChatTitleById({ chatId: id, title });
-            }
+            updateChatTitleById({ chatId: id, title });
           } catch {
             /* non-fatal */
           }
@@ -380,10 +416,6 @@ export async function POST(request: Request) {
       },
       generateId: generateUUID,
       onEnd: async ({ messages: finishedMessages }) => {
-        if (!persist) {
-          return;
-        }
-
         if (isToolApprovalFlow) {
           await Promise.all(
             finishedMessages.map(async (finishedMsg) => {
@@ -441,7 +473,7 @@ export async function POST(request: Request) {
 
     return createUIMessageStreamResponse({
       async consumeSseStream({ stream: sseStream }) {
-        if (!persist || !process.env.REDIS_URL) {
+        if (!process.env.REDIS_URL) {
           return;
         }
         try {
